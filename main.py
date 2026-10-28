@@ -49,7 +49,7 @@ class WakePlugin(Star):
         # 图片缓存的时间戳，超过 PENDING_IMAGE_TTL 秒没人来取就丢掉，防止长期占内存
         self._pending_images_ts: dict[str, float] = {}
         logger.info(
-            "[wake] 叫醒小鲸鱼 v1.1.0 已加载（history_count=%s, 合并连续消息=开）",
+            "[wake] 叫醒小鲸鱼 v1.1.1 已加载（history_count=%s, 合并连续消息=开）",
             self._cfg().history_count,
         )
 
@@ -233,11 +233,17 @@ class WakePlugin(Star):
             self._log(cfg, umo, scenario, f"判断要回，但概率 {cfg.reply_probability} 未命中")
             return
 
-        self._wake(event, scenario)
+        self._wake(event, scenario, message)
 
-    def _wake(self, event: AstrMessageEvent, source: str):
+    def _wake(self, event: AstrMessageEvent, source: str, merged: str = ""):
         event.is_at_or_wake_command = True
         event.set_extra("wake_source", source)
+        # 把「合并后的完整一句」写回这条消息。
+        # 唤醒只标记当前这一条，被合并进来的第 2~N 条不会进 pipeline，
+        # 不写回的话它们的内容在小模型判断时看到了、回复时却看不到。
+        if merged and merged != (event.message_str or "").strip():
+            event.message_str = merged
+            event.set_extra("wake_merged", merged)
 
     # ================= 防抖 =================
 
@@ -461,8 +467,8 @@ class WakePlugin(Star):
         """
         raw = list(self._history.get(umo, []))
         parts: list[str] = []
-        # 从尾部往前收同一人的连续发言，最多 10 条，防止刷屏合并成长文
-        while raw and raw[-1][0] == sender_name and len(parts) < 10:
+        # 从尾部往前收同一人的连续发言，最多收到 deque 上限，防止刷屏合并成长文
+        while raw and raw[-1][0] == sender_name and len(parts) < MAX_HISTORY:
             parts.insert(0, raw.pop()[1])
         # [图片] 占位后面补个空格，避免和后面的文字粘成一坨（"你/在/干"这种不加）
         fixed = [p + " " if p.startswith("[图片]") else p for p in parts]
