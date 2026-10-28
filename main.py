@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 from collections import deque
 
@@ -28,6 +29,16 @@ from astrbot.core.platform.message_type import MessageType
 from .config import WakeConfig
 from .judge import judge as run_judge
 from .state import WindowManager
+
+# qq_tools 之类的插件会往 event.message_str 尾部追加「 [MSG_ID:123]」，
+# 那是给它自己的工具用的。留着会污染判断输入（小模型看到一串数字 ID），
+# 也会被合并进 merged 再写回消息。这里统一剥掉。
+_MSG_ID_RE = re.compile(r"\s*\[MSG_ID:\d+\]\s*")
+
+
+def _strip_msg_id(text: str) -> str:
+    """剥掉消息尾部的 [MSG_ID:xxx] 标记。"""
+    return _MSG_ID_RE.sub("", text or "").strip()
 
 MAX_HISTORY = 20          # 每个群保留多少条历史给判断用
 HISTORY_FOR_PROMPT = 8    # 实际塞进 prompt 的条数
@@ -49,7 +60,7 @@ class WakePlugin(Star):
         # 图片缓存的时间戳，超过 PENDING_IMAGE_TTL 秒没人来取就丢掉，防止长期占内存
         self._pending_images_ts: dict[str, float] = {}
         logger.info(
-            "[wake] 叫醒小鲸鱼 v1.1.1 已加载（history_count=%s, 合并连续消息=开）",
+            "[wake] 叫醒小鲸鱼 v1.1.2 已加载（history_count=%s, 合并连续消息=开）",
             self._cfg().history_count,
         )
 
@@ -205,7 +216,7 @@ class WakePlugin(Star):
         history, message = self._split_history_tail(
             umo, sender_name, event, cfg.history_count
         )
-        if message != (event.message_str or "").strip():
+        if message != _strip_msg_id(event.message_str):
             self._log(cfg, umo, scenario, f"合并连续消息为一句：{message[:60]}")
 
         result = await run_judge(
@@ -241,7 +252,7 @@ class WakePlugin(Star):
         # 把「合并后的完整一句」写回这条消息。
         # 唤醒只标记当前这一条，被合并进来的第 2~N 条不会进 pipeline，
         # 不写回的话它们的内容在小模型判断时看到了、回复时却看不到。
-        if merged and merged != (event.message_str or "").strip():
+        if merged and merged != _strip_msg_id(event.message_str):
             event.message_str = merged
             event.set_extra("wake_merged", merged)
 
@@ -316,10 +327,10 @@ class WakePlugin(Star):
 
     def _should_skip(self, event: AstrMessageEvent, cfg: WakeConfig) -> bool:
         # 没文字（纯图/纯表情）
-        if not (event.message_str or "").strip():
+        text = _strip_msg_id(event.message_str)
+        if not text:
             return True
         # 指令
-        text = event.message_str.strip()
         if text[:1] in ("/", "#", "!", "！"):
             return True
         # @ 了别人（不是她）
@@ -384,7 +395,7 @@ class WakePlugin(Star):
         del buf[:-3]  # 最多留 3 张
         self._pending_images_ts[umo] = time.time()
         self._log(cfg, umo, "image", f"缓存 {len(paths)} 张图，等文字消息带走")
-        return not (event.message_str or "").strip()
+        return not _strip_msg_id(event.message_str)
 
     def _gc_pending_images(self, now: float | None = None) -> None:
         """清掉长时间没人来取的图片缓存，防止纯图消息后一直占着内存。"""
@@ -425,7 +436,7 @@ class WakePlugin(Star):
         return (getattr(resp, "completion_text", "") or "").strip()
 
     def _remember(self, umo: str, event: AstrMessageEvent):
-        text = (event.message_str or "").strip()
+        text = _strip_msg_id((event.message_str or "").strip())
         if not text:
             # 纯图/表情/空消息：记一个占位，让小模型知道「这个人刚发了张图」，
             # 但不带图片内容（内容由 AstrBot 的群聊上下文负责）。
@@ -474,7 +485,7 @@ class WakePlugin(Star):
         fixed = [p + " " if p.startswith("[图片]") else p for p in parts]
         merged = "".join(fixed).strip()
         if not merged:
-            merged = (event.message_str or "").strip()
+            merged = _strip_msg_id(event.message_str)
         return raw[-max(1, count):], merged
 
     # ================= 自述 / 日志 =================
