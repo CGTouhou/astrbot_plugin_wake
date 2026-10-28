@@ -1,0 +1,112 @@
+{
+  "enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用「叫醒小鲸鱼」",
+    "hint": "总开关。关掉后本插件完全不介入，群消息全部交给 AstrBot 自带的概率回复"
+  },
+  "whitelist_groups": {
+    "type": "list",
+    "default": [],
+    "description": "生效群号白名单",
+    "hint": "留空 = 所有群生效；填了就只在这些群里判断。建议填上你实际要用的群号"
+  },
+  "keywords": {
+    "type": "list",
+    "default": [],
+    "description": "唤醒关键词",
+    "hint": "消息里包含任意一个词就进入小模型判断。比如「小鲸鱼」「鲸鱼」「肥鱼」。也可以聊到兴趣话题就填「原神」「王者」"
+  },
+  "self_name": {
+    "type": "string",
+    "default": "",
+    "description": "她自己的名字（可填多个）",
+    "hint": "判断时告诉小模型「你是谁」。可以填多个名字，用空格或逗号隔开，比如「小鲸鱼 大肥鱼」，每个名字都会被当成关键词；第一个是主名。留空则用「她」"
+  },
+  "auto_keywords": {
+    "type": "bool",
+    "default": true,
+    "description": "自动补充关键词",
+    "hint": "开启后自动把「她自己的每一个名字」都加进关键词，无需手动重复填"
+  },
+  "window_seconds": {
+    "type": "int",
+    "default": 60,
+    "description": "窗口时长（秒）",
+    "hint": "她被唤醒后，这段时间内每条消息都会判断是否接话。每回复一次就重新计时。设 0 = 关闭窗口（只做关键词唤醒，回复一次就睡）"
+  },
+  "debounce_seconds": {
+    "type": "float",
+    "default": 1.5,
+    "description": "输入防抖 · 窗口内（秒）",
+    "hint": "窗口内（她刚说过话、正在对话）收到消息后先等这么久再判断；这期间又来了新消息就重新计时。窗口内反应要快，建议 1~1.5。0 = 关闭防抖"
+  },
+  "debounce_outside": {
+    "type": "float",
+    "default": 2.5,
+    "description": "输入防抖 · 窗口外（秒）",
+    "hint": "窗口外（她不在对话里）的防抖，可以设得比窗口内长，比如 2.5~3。留 0 = 跟随「窗口内」的值。适合「先发一个名字，再补一句」这种打法"
+  },
+  "reply_probability": {
+    "type": "float",
+    "default": 1.0,
+    "description": "判断该回时的实际回复概率",
+    "hint": "小模型判定「该回」之后，再按这个概率决定回不回。1.0 = 必回；0.8 = 八成回（默认，带点随机更自然）；0.5 = 一半；0 = 永不回"
+  },
+  "llm_provider": {
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "description": "判断用的小模型",
+    "hint": "留空 = 用当前会话的默认模型"
+  },
+  "judge_timeout": {
+    "type": "int",
+    "default": 15,
+    "description": "判断超时（秒）",
+    "hint": "小模型多久没回就当作这次判断失败。失败后按「判断失败时唤醒」处理。建议 10~20 秒：太小容易超时误唤醒，太大群里会等太久（最多 120 秒）"
+  },
+  "history_count": {
+    "type": "int",
+    "default": 10,
+    "description": "喂给小模型的上下文条数",
+    "hint": "判断时把最近几条群聊记录塞进提示词。太少看不清在聊什么，太多费 token。建议 8~12 条（范围 1~20）"
+  },
+  "enable_image": {
+    "type": "bool",
+    "description": "把图片转成文字（她才能看见）",
+    "hint": "开启后，群里发的图片会先让视觉模型描述成文字，再塞进她下一轮的上下文。纯图消息不触发判断，只等你叫她的那条消息带上描述。",
+    "default": false
+  },
+  "image_caption_provider": {
+    "type": "string",
+    "description": "图片描述用的视觉模型",
+    "hint": "留空则用 AstrBot「图片转述模型」的配置（provider_settings.default_image_caption_provider_id）。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "prompt_keyword": {
+    "type": "text",
+    "default": "{who_am_i}\n【最近的群聊】（越靠下越新，方括号里是发言人）\n{history}\n\n【刚收到的新消息】\n[{sender_name}] {message}\n\n【你的任务】\n上面的新消息里提到了关键词：{hit_keywords}\n\n判断这是哪一种情况：\n1. 有人在叫你 → 应该接话\n2. 有人在聊你感兴趣的话题，你可以插一句 → 视情况接话\n3. 只是顺口提到、在说别人、或跟你无关 → 不接\n\n只输出一行 JSON，不要解释：\n{\"action\": \"reply\" 或 \"skip\", \"reason\": \"一句话理由\"}",
+    "description": "判断提示词（关键词命中 / 窗口外）",
+    "hint": "可用占位符：{who_am_i} {self_name} {persona_line} {history} {sender_name} {message} {hit_keywords}  留空则用内置默认"
+  },
+  "prompt_window": {
+    "type": "text",
+    "default": "{who_am_i}\n【最近的群聊】（越靠下越新，方括号里是发言人；你自己的发言标着「你」）\n{history}\n\n【刚收到的新消息】\n[{sender_name}] {message}\n\n【你的任务】\n你刚才还在参与这段对话。判断这条新消息是不是在跟你说话：\n- 在问你、回应你、接着你的话说 → reply\n- 别人之间的对话，跟你无关 → skip\n\n只输出一行 JSON，不要解释：\n{\"action\": \"reply\" 或 \"skip\", \"reason\": \"一句话理由\"}",
+    "description": "判断提示词（窗口内）",
+    "hint": "可用占位符：{who_am_i} {self_name} {persona_line} {history} {sender_name} {message}  留空则用内置默认"
+  },
+  "fail_open": {
+    "type": "bool",
+    "default": true,
+    "description": "判断失败时唤醒",
+    "hint": "小模型超时或返回格式错误时的兜底。开启 = 宁可多接一句也别漏；关闭 = 失败就当没听见"
+  },
+  "debug_log": {
+    "type": "bool",
+    "default": false,
+    "description": "输出调试日志",
+    "hint": "开启后每次判断都会打印命中关键词、小模型原始返回和结论，用于调提示词"
+  }
+}
