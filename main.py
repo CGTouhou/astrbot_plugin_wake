@@ -36,6 +36,24 @@ from .state import WindowManager
 _MSG_ID_RE = re.compile(r"\s*\[MSG_ID:\d+\]\s*")
 
 
+def _drop_from_history(history: list[tuple[str, str]], parts: list[str]) -> list[tuple[str, str]]:
+    """把本轮已经并进「新消息」的那几条从历史里摘掉，避免 prompt 里重复。
+
+    原来这一步由 _split_history_tail 里的 raw.pop() 顺手做掉；v1.1.9 改成
+    防抖记账后没地方删了，结果同一条消息在「最近的群聊」和「刚收到的新消息」
+    各出现一次。
+    """
+    if not parts:
+        return history
+    out = list(history)
+    for text in reversed(parts):
+        for i in range(len(out) - 1, -1, -1):
+            if out[i][1] == text:
+                out.pop(i)
+                break
+    return out
+
+
 def _strip_msg_id(text: str) -> str:
     """剥掉消息尾部的 [MSG_ID:xxx] 标记。"""
     return _MSG_ID_RE.sub("", text or "").strip()
@@ -43,7 +61,6 @@ def _strip_msg_id(text: str) -> str:
 MAX_HISTORY = 20          # 每个群保留多少条历史给判断用
 HISTORY_FOR_PROMPT = 8    # 实际塞进 prompt 的条数
 PENDING_IMAGE_TTL = 300   # 缓存的图超过这么久没人取就丢掉（秒）
-HISTORY_MERGE_WINDOW = 60 # 同一人连续发言超过这么久就不再合并（秒）
 
 
 class WakePlugin(Star):
@@ -58,6 +75,9 @@ class WakePlugin(Star):
         self._latest_token: dict[str, int] = {}
         # 防抖：umo → (发送者ID, 该发送者最后一条消息)。醒来判断时优先用它
         self._latest_event: dict[str, tuple[str, AstrMessageEvent]] = {}
+        # 防抖账本：umo:sender → 本轮被防抖吞掉的那几句。
+        # 赢家结算时取出来拼成一条；只有一条就不拼，保持原样。
+        self._group_pending: dict[str, list[str]] = {}
         # 私聊防抖：umo → 本次窗口内收到的文本，最后一条醒来时合并成一句
         self._private_pending: dict[str, list[str]] = {}
         # 防抖 token 的自增序号。不能用 time.monotonic()：Windows 上精度约
@@ -71,7 +91,7 @@ class WakePlugin(Star):
         # 图片缓存的时间戳，超过 PENDING_IMAGE_TTL 秒没人来取就丢掉，防止长期占内存
         self._pending_images_ts: dict[str, float] = {}
         logger.info(
-            "[wake] 叫醒小鲸鱼 v1.1.8 已加载（history_count=%s, 合并连续消息=开）",
+            "[wake] 叫醒小鲸鱼 v1.1.11 已加载（history_count=%s, 合并连续消息=开）",
             self._cfg().history_count,
         )
 
@@ -121,6 +141,7 @@ class WakePlugin(Star):
 
         # ② 窗口内 → 每条都问小模型（走防抖：等对方把话打完）
         if self.window.is_active(umo):
+            self._note_group_pending(umo, event)
             await self._debounced_judge(
                 event, cfg, umo, "window", [], cfg.debounce_for("window")
             )
@@ -133,6 +154,7 @@ class WakePlugin(Star):
             return
 
         self._log(cfg, umo, "keyword", f"命中关键词 {hits}")
+        self._note_group_pending(umo, event)
         await self._debounced_judge(
             event, cfg, umo, "keyword", hits, cfg.debounce_for("keyword")
         )
@@ -184,10 +206,11 @@ class WakePlugin(Star):
         parts = self._private_pending.pop(umo, [])
         if not parts:
             return
-        merged = "".join(parts).strip()
+        # 和群聊一致：换行分隔，别把两句粘成一个词
+        merged = "\n".join(parts).strip()
         if merged and merged != _strip_msg_id(event.message_str or ""):
             event.message_str = merged
-            self._log(cfg, umo, "private", f"合并连续消息为一句：{merged}")
+            self._log(cfg, umo, "private", f"合并连续消息为一段：{merged}")
 
     # ================= 钩子 2：她生成了回复 → 开窗 =================
 
@@ -269,6 +292,8 @@ class WakePlugin(Star):
         scenario: str,
         hit_keywords: list[str] | None = None,
         wake_event: AstrMessageEvent | None = None,
+        merged_override: str | None = None,
+        merged_parts: list[str] | None = None,
     ):
         provider = await self._get_provider(cfg, umo)
         if provider is None:
@@ -280,6 +305,9 @@ class WakePlugin(Star):
         history, message = self._split_history_tail(
             umo, sender_name, event, cfg.history_count
         )
+        history = _drop_from_history(history, merged_parts or [])
+        if merged_override:
+            message = merged_override
         if message != _strip_msg_id(event.message_str):
             self._log(cfg, umo, scenario, f"合并连续消息为一句：{message[:60]}")
 
@@ -336,6 +364,19 @@ class WakePlugin(Star):
         )
 
     # ================= 防抖 =================
+
+    def _note_group_pending(self, umo: str, event: AstrMessageEvent) -> None:
+        """把这句记进「本轮防抖待合并」账本。
+
+        防抖只让最后一条去判断，前面几条会 return 掉。它们的内容如果不
+        记账就彻底丢了 —— 最后一条若是「在吗」这种碎片，小模型容易判成
+        「不是在叫我」。所以先记账，赢家结算时一起拼进去。
+        """
+        text = _strip_msg_id(event.message_str or "").strip()
+        if not text:
+            return
+        key = f"{umo}:{self._sender_id(event)}"
+        self._group_pending.setdefault(key, []).append(text)
 
     def _limit_wait(self, cfg: WakeConfig, key: str, scenario: str, delay: float) -> float:
         """把本次要等的时间裁到「最大等待」的剩余额度内。
@@ -407,6 +448,12 @@ class WakePlugin(Star):
         if target is not event:
             self._log(cfg, umo, scenario, "防抖：改用最新的那条消息判断")
 
+        # 结算本轮账本：只有一条就不拼（正常说话保持原样），
+        # 两条以上才合并，且只用被防抖吞掉的那几条。
+        pending_key = f"{umo}:{self._sender_id(event)}"
+        parts = self._group_pending.pop(pending_key, [])
+        merged_text = "\n".join(parts) if len(parts) > 1 else ""
+
         await self._judge_and_maybe_wake(
             target,
             cfg,
@@ -414,6 +461,8 @@ class WakePlugin(Star):
             scenario=scenario,
             hit_keywords=hit_keywords,
             wake_event=event,
+            merged_override=merged_text or None,
+            merged_parts=parts or None,
         )
 
     @staticmethod
@@ -581,35 +630,18 @@ class WakePlugin(Star):
         event: AstrMessageEvent,
         count: int = HISTORY_FOR_PROMPT,
     ) -> tuple[list[tuple[str, str]], str]:
-        """把历史尾部「这个人连续说的几句」摘出来，合并成一条待判消息。
+        """取最近的历史，和本条消息的文本。
 
-        对付「一个字一个字敲」：
-            你 / 在 / 干 / 什 / 么
-        五条会被拼成「你在干什么」，当成一条新消息交给小模型，
-        历史里也不再重复出现这五条，模型不会看到「新消息：么」这种怪东西。
-
-        返回 (剩下的历史, 合并后的消息)。
+        合并交给防抖账本（_group_pending）负责：只有被防抖吞掉的那几条
+        才会拼在一起。这里不再从历史往回捞 —— 否则 60 秒内同一人的完整
+        句子也会被当成「连发」拼起来（2026-10-29 23:14 那次就是这样）。
         """
         raw = list(self._history.get(umo, []))
-        parts: list[str] = []
-        now = time.monotonic()
-        # 从尾部往前收同一人的连续发言，最多收到 deque 上限，防止刷屏合并成长文
-        while raw and raw[-1][0] == sender_name and len(parts) < MAX_HISTORY:
-            item = raw[-1]
-            # 隔太久的旧发言不算「同一次说话」。否则上一轮没成功回复时，
-            # 「你/…」不会打断连续性，旧发言一直留着，下一轮再发同样的
-            # 内容就会被合并成「大肥鱼你在吗大肥鱼你在吗」。
-            ts = item[2] if len(item) > 2 else now
-            if now - ts > HISTORY_MERGE_WINDOW:
-                break
-            parts.insert(0, raw.pop()[1])
-        # [图片] 占位后面补个空格，避免和后面的文字粘成一坨（"你/在/干"这种不加）
-        fixed = [p + " " if p.startswith("[图片]") else p for p in parts]
-        merged = "".join(fixed).strip()
-        if not merged:
-            merged = _strip_msg_id(event.message_str)
-        # judge.py 那边是严格解包 (speaker, text)，时间戳只在本函数内用
-        return [(item[0], item[1]) for item in raw[-max(1, count):]], merged
+        # judge.py 那边是严格解包 (speaker, text)，时间戳只在本模块内用
+        return (
+            [(item[0], item[1]) for item in raw[-max(1, count):]],
+            _strip_msg_id(event.message_str),
+        )
 
     # ================= 自述 / 日志 =================
 
@@ -758,4 +790,5 @@ class WakePlugin(Star):
         self._pending_images.clear()
         self._pending_images_ts.clear()
         self._private_pending.clear()
+        self._group_pending.clear()
         self._debounce_start.clear()
