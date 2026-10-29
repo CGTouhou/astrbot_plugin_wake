@@ -43,6 +43,7 @@ def _strip_msg_id(text: str) -> str:
 MAX_HISTORY = 20          # 每个群保留多少条历史给判断用
 HISTORY_FOR_PROMPT = 8    # 实际塞进 prompt 的条数
 PENDING_IMAGE_TTL = 300   # 缓存的图超过这么久没人取就丢掉（秒）
+HISTORY_MERGE_WINDOW = 60 # 同一人连续发言超过这么久就不再合并（秒）
 
 
 class WakePlugin(Star):
@@ -50,17 +51,27 @@ class WakePlugin(Star):
         super().__init__(context)
         self.config = config
         self.window = WindowManager()
-        self._history: dict[str, deque[tuple[str, str]]] = {}
-        # 防抖：umo → 判断任务 token（只有最新那个能通过）
-        self._latest_token: dict[str, float] = {}
+        self._history: dict[str, deque[tuple[str, str, float]]] = {}
+        # 防抖：umo:sender → 判断任务 token（只有这个人最新的那个能通过）。
+        # key 里带 sender 是必须的：只用 umo 时，A、B 在 1.5 秒内先后叫她，
+        # B 的 token 会把 A 的顶掉，A 那条直接 return，不唤醒也不回复。
+        self._latest_token: dict[str, int] = {}
         # 防抖：umo → (发送者ID, 该发送者最后一条消息)。醒来判断时优先用它
         self._latest_event: dict[str, tuple[str, AstrMessageEvent]] = {}
+        # 私聊防抖：umo → 本次窗口内收到的文本，最后一条醒来时合并成一句
+        self._private_pending: dict[str, list[str]] = {}
+        # 防抖 token 的自增序号。不能用 time.monotonic()：Windows 上精度约
+        # 15.6ms，连发的消息会取到同一个值，导致先到的反而抢到放行权。
+        self._debounce_seq: int = 0
+        # 防抖轮次的起始时刻：token_key → monotonic 时间。用于「最大等待」上限，
+        # 从这一轮第一条算起，防止一直被新消息刷新而永远不判断。
+        self._debounce_start: dict[str, float] = {}
         # 图片：umo → 待消费的本地图片路径（图/文字分开发时用）
         self._pending_images: dict[str, list[str]] = {}
         # 图片缓存的时间戳，超过 PENDING_IMAGE_TTL 秒没人来取就丢掉，防止长期占内存
         self._pending_images_ts: dict[str, float] = {}
         logger.info(
-            "[wake] 叫醒小鲸鱼 v1.1.2 已加载（history_count=%s, 合并连续消息=开）",
+            "[wake] 叫醒小鲸鱼 v1.1.8 已加载（history_count=%s, 合并连续消息=开）",
             self._cfg().history_count,
         )
 
@@ -125,6 +136,58 @@ class WakePlugin(Star):
         await self._debounced_judge(
             event, cfg, umo, "keyword", hits, cfg.debounce_for("keyword")
         )
+
+
+    # ================= 钩子 1b：收到私聊消息 =================
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=900)
+    async def on_private_message(self, event: AstrMessageEvent):
+        """私聊防抖：等对方把话说完，再合并成一句交给她。
+
+        群里由 wake 判断「要不要醒」，私聊不需要判断 —— AstrBot 默认私聊
+        全部唤醒（waking_check 里 is_private_chat 分支）。这里只解决「连发
+        三句被当成三轮对话、回三次」：第一条之后每来一条就重新计时，只有
+        最后一条放行，前面的 stop_event 掉（既不进 LLM 也不发消息），并把
+        它们的文字合并进最后这条。
+        """
+        cfg = self._cfg()
+        if not cfg.enabled:
+            return
+        delay = cfg.debounce_for("private")
+        if delay <= 0:
+            # 开关刚关掉时，之前攒下的文本没人会来取了，顺手清掉
+            self._private_pending.pop(event.unified_msg_origin, None)
+            self._debounce_start.pop(event.unified_msg_origin, None)
+            return
+
+        umo = event.unified_msg_origin
+        text = _strip_msg_id((event.message_str or "").strip())
+        if text.startswith("/"):
+            # 命令直接放行，别让 /wake 这类操作白等 1.5 秒
+            return
+
+        if text:
+            self._private_pending.setdefault(umo, []).append(text)
+
+        self._debounce_seq += 1
+        token = self._debounce_seq
+        self._latest_token[umo] = token
+        delay = self._limit_wait(cfg, umo, "private", delay)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if self._latest_token.get(umo) != token:
+            # 后面还有新消息，让它代表这一段；自己既不进 LLM 也不发消息
+            event.stop_event()
+            return
+        self._debounce_start.pop(umo, None)
+
+        parts = self._private_pending.pop(umo, [])
+        if not parts:
+            return
+        merged = "".join(parts).strip()
+        if merged and merged != _strip_msg_id(event.message_str or ""):
+            event.message_str = merged
+            self._log(cfg, umo, "private", f"合并连续消息为一句：{merged}")
 
     # ================= 钩子 2：她生成了回复 → 开窗 =================
 
@@ -205,6 +268,7 @@ class WakePlugin(Star):
         *,
         scenario: str,
         hit_keywords: list[str] | None = None,
+        wake_event: AstrMessageEvent | None = None,
     ):
         provider = await self._get_provider(cfg, umo)
         if provider is None:
@@ -244,7 +308,10 @@ class WakePlugin(Star):
             self._log(cfg, umo, scenario, f"判断要回，但概率 {cfg.reply_probability} 未命中")
             return
 
-        self._wake(event, scenario, message)
+        # 防抖可能把判断对象换成了更新的那条消息，而那条消息的 pipeline
+        # 早已走完 —— 事后置 is_at_or_wake_command 不会生效。真正还在等
+        # 的是发起本次防抖判断的那条 event，唤醒必须打在它身上。
+        self._wake(wake_event or event, scenario, message)
 
     def _wake(self, event: AstrMessageEvent, source: str, merged: str = ""):
         event.is_at_or_wake_command = True
@@ -255,8 +322,43 @@ class WakePlugin(Star):
         if merged and merged != _strip_msg_id(event.message_str):
             event.message_str = merged
             event.set_extra("wake_merged", merged)
+        logger.info(
+            "[wake] 已唤醒 source=%s umo=%s stopped=%s at_or_wake=%s "
+            "send_oper=%s call_llm=%s has_result=%s msg=%r",
+            source,
+            event.unified_msg_origin,
+            event.is_stopped(),
+            event.is_at_or_wake_command,
+            getattr(event, "_has_send_oper", "?"),
+            getattr(event, "call_llm", "?"),
+            bool(event.get_result()),
+            (event.message_str or "")[:40],
+        )
 
     # ================= 防抖 =================
+
+    def _limit_wait(self, cfg: WakeConfig, key: str, scenario: str, delay: float) -> float:
+        """把本次要等的时间裁到「最大等待」的剩余额度内。
+
+        防抖是「等到没人说话」，但如果对方一直在说，这个条件永远不成立，
+        窗口就被无限刷新，她永远等不到判断。所以从这一轮第一条消息开始记
+        一个起点，最多等 max_wait 秒；到点返回 0（不再等），立刻判断一次。
+        """
+        max_wait = cfg.max_wait_for(scenario) if cfg else 0.0
+        if max_wait <= 0:
+            return delay
+        now = time.monotonic()
+        start = self._debounce_start.get(key)
+        # 起点超过一整轮还没被消费，说明上一轮是异常收尾（判断抛错、
+        # handler 被取消之类，没走到放行那句的清理）。这种情况直接重置，
+        # 否则这次会算出负数额度、立刻判断，防抖等于没生效。
+        if start is None or now - start > max_wait * 2:
+            start = now
+            self._debounce_start[key] = start
+        remain = max_wait - (now - start)
+        if remain <= 0:
+            return 0.0
+        return min(delay, remain)
 
     async def _debounced_judge(
         self,
@@ -270,7 +372,7 @@ class WakePlugin(Star):
         """等对方把话说完再判断。
 
         做法：每条消息都在自己的 handler 里睡 `delay` 秒，睡醒后检查
-        「我是不是这个群最新的那个判断任务」——
+        「我是不是这个人最新的那个判断任务」——
         是就判断，不是就让更新的那个接管（说明对方还在敲）。
 
         判断时优先用「同一个人的最后一条消息」：
@@ -278,28 +380,40 @@ class WakePlugin(Star):
         这样接的是完整的一句话，而不是只看到「大肥鱼」三个字。
         """
         if delay > 0:
-            token = time.monotonic()
-            self._latest_token[umo] = token
-            await asyncio.sleep(delay)
-            if self._latest_token.get(umo) != token:
+            # 按「会话 + 发送者」独立防抖：只合并同一个人连发的话，
+            # 别人同时开口不能把这条挤掉。
+            token_key = f"{umo}:{self._sender_id(event)}"
+            self._debounce_seq += 1
+            token = self._debounce_seq
+            self._latest_token[token_key] = token
+            delay = self._limit_wait(cfg, token_key, scenario, delay)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if self._latest_token.get(token_key) != token:
                 self._log(cfg, umo, scenario, "防抖：有更新的判断任务接管，本条放弃")
                 return
+            self._debounce_start.pop(token_key, None)
 
         target = event
         latest = self._latest_event.get(umo)
         if latest is not None:
             sender_id, latest_event = latest
-            if scenario == "window":
-                # 窗口内：谁最后说话都可能是「在跟她说话」，直接用最新那条
-                target = latest_event
-            elif sender_id == self._sender_id(event):
-                # 窗口外：只有同一个人继续补充的话才合并，换人了仍用触发那条
+            # 只有「同一个人继续补充」才把判断对象换成最新那条。
+            # 换人了必须仍用触发的那条：否则别人的话会被当成新消息去判断，
+            # 合并出来的是别人的发言，最后还会把别人的话写回自己这条的
+            # message_str（窗口内别人 @ 她时就会踩到）。
+            if sender_id == self._sender_id(event):
                 target = latest_event
         if target is not event:
             self._log(cfg, umo, scenario, "防抖：改用最新的那条消息判断")
 
         await self._judge_and_maybe_wake(
-            target, cfg, umo, scenario=scenario, hit_keywords=hit_keywords
+            target,
+            cfg,
+            umo,
+            scenario=scenario,
+            hit_keywords=hit_keywords,
+            wake_event=event,
         )
 
     @staticmethod
@@ -458,7 +572,7 @@ class WakePlugin(Star):
         if buf is None:
             buf = deque(maxlen=MAX_HISTORY)
             self._history[umo] = buf
-        buf.append((speaker, text))
+        buf.append((speaker, text, time.monotonic()))
 
     def _split_history_tail(
         self,
@@ -478,15 +592,24 @@ class WakePlugin(Star):
         """
         raw = list(self._history.get(umo, []))
         parts: list[str] = []
+        now = time.monotonic()
         # 从尾部往前收同一人的连续发言，最多收到 deque 上限，防止刷屏合并成长文
         while raw and raw[-1][0] == sender_name and len(parts) < MAX_HISTORY:
+            item = raw[-1]
+            # 隔太久的旧发言不算「同一次说话」。否则上一轮没成功回复时，
+            # 「你/…」不会打断连续性，旧发言一直留着，下一轮再发同样的
+            # 内容就会被合并成「大肥鱼你在吗大肥鱼你在吗」。
+            ts = item[2] if len(item) > 2 else now
+            if now - ts > HISTORY_MERGE_WINDOW:
+                break
             parts.insert(0, raw.pop()[1])
         # [图片] 占位后面补个空格，避免和后面的文字粘成一坨（"你/在/干"这种不加）
         fixed = [p + " " if p.startswith("[图片]") else p for p in parts]
         merged = "".join(fixed).strip()
         if not merged:
             merged = _strip_msg_id(event.message_str)
-        return raw[-max(1, count):], merged
+        # judge.py 那边是严格解包 (speaker, text)，时间戳只在本函数内用
+        return [(item[0], item[1]) for item in raw[-max(1, count):]], merged
 
     # ================= 自述 / 日志 =================
 
@@ -634,3 +757,5 @@ class WakePlugin(Star):
         self._latest_event.clear()
         self._pending_images.clear()
         self._pending_images_ts.clear()
+        self._private_pending.clear()
+        self._debounce_start.clear()

@@ -22,14 +22,19 @@ class WakeConfig:
     keywords: list[str] = field(default_factory=list)
     self_name: str = "小鲸鱼"
     auto_keywords: bool = True
-    window_seconds: int = 120
-    debounce_seconds: float = 2.5
-    debounce_outside: float = 0.0
-    reply_probability: float = 0.8
+    window_seconds: int = 60
+    group_debounce_enabled: bool = True
+    debounce_seconds: float = 1.5
+    debounce_outside: float = 2.5
+    debounce_max_wait: float = 8.0
+    private_debounce_enabled: bool = True
+    private_debounce_seconds: float = 1.5
+    private_debounce_max_wait: float = 8.0
+    reply_probability: float = 1.0
     llm_provider: str = ""
     judge_timeout: float = 15.0
-    history_count: int = 8
-    enable_image: bool = True
+    history_count: int = 10
+    enable_image: bool = False
     image_caption_provider: str = ""
     prompt_keyword: str = ""
     prompt_window: str = ""
@@ -47,20 +52,33 @@ class WakeConfig:
         cfg.keywords = _as_str_list(raw.get("keywords"))
         cfg.self_name = str(raw.get("self_name") or "").strip()
         cfg.auto_keywords = _as_bool(raw.get("auto_keywords"), True)
-        cfg.window_seconds = _as_int(raw.get("window_seconds"), 120, low=0, high=3600)
+        cfg.window_seconds = _as_int(raw.get("window_seconds"), 60, low=0, high=3600)
+        cfg.group_debounce_enabled = _as_bool(raw.get("group_debounce_enabled"), True)
         cfg.debounce_seconds = _as_float(
-            raw.get("debounce_seconds"), 2.5, low=0.0, high=15.0
+            raw.get("debounce_seconds"), 1.5, low=0.0, high=15.0
         )
         cfg.debounce_outside = _as_float(
-            raw.get("debounce_outside"), 0.0, low=0.0, high=15.0
+            raw.get("debounce_outside"), 2.5, low=0.0, high=15.0
+        )
+        cfg.debounce_max_wait = _as_float(
+            raw.get("debounce_max_wait"), 8.0, low=0.0, high=120.0
+        )
+        cfg.private_debounce_enabled = _as_bool(
+            raw.get("private_debounce_enabled"), True
+        )
+        cfg.private_debounce_seconds = _as_float(
+            raw.get("private_debounce_seconds"), 1.5, low=0.0, high=15.0
+        )
+        cfg.private_debounce_max_wait = _as_float(
+            raw.get("private_debounce_max_wait"), 8.0, low=0.0, high=120.0
         )
         cfg.reply_probability = _as_float(
-            raw.get("reply_probability"), 0.8, low=0.0, high=1.0
+            raw.get("reply_probability"), 1.0, low=0.0, high=1.0
         )
         cfg.llm_provider = str(raw.get("llm_provider") or "").strip()
         cfg.judge_timeout = _as_float(raw.get("judge_timeout"), 15.0, low=3.0, high=120.0)
-        cfg.history_count = _as_int(raw.get("history_count"), 8, low=1, high=20)
-        cfg.enable_image = _as_bool(raw.get("enable_image"), True)
+        cfg.history_count = _as_int(raw.get("history_count"), 10, low=1, high=20)
+        cfg.enable_image = _as_bool(raw.get("enable_image"), False)
         cfg.image_caption_provider = str(
             raw.get("image_caption_provider") or ""
         ).strip()
@@ -98,11 +116,29 @@ class WakeConfig:
     def debounce_for(self, scenario: str) -> float:
         """取该场景的防抖秒数。
 
-        窗口外（keyword）用 debounce_outside；它没填（0）就跟随 debounce_seconds。
+        private 走私聊自己的开关和秒数；群聊受 group_debounce_enabled 总开关控制。
+        返回 0 表示不防抖，立即判断。
         """
+        if scenario == "private":
+            if not self.private_debounce_enabled:
+                return 0.0
+            return self.private_debounce_seconds
+        if not self.group_debounce_enabled:
+            return 0.0
         if scenario == "keyword" and self.debounce_outside > 0:
             return self.debounce_outside
         return self.debounce_seconds
+
+    def max_wait_for(self, scenario: str) -> float:
+        """取该场景的最大等待秒数（防抖被无限刷新时的硬上限）。
+
+        从这一轮第一条消息算起，超过这个时间无论有没有新消息都强制判断。
+        没有它的话，对方只要一直在刷，「等到没人说话」就永远不到。
+        返回 0 表示不设上限。
+        """
+        if scenario == "private":
+            return self.private_debounce_max_wait
+        return self.debounce_max_wait
 
     def all_keywords(self, auto: list[str]) -> list[str]:
         """手动关键词 + 自动关键词，去重保序，忽略空串。"""

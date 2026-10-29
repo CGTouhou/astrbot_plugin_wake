@@ -1,6 +1,6 @@
 name: astrbot_plugin_wake
 display_name: 叫醒小鲸鱼
-version: v1.1.2
+version: v1.1.8
 author: CG
 desc: 被@一次就能接着聊：关键词粗筛 + 小模型精判 + 唤醒窗口。只写 is_at_or_wake_command，不碰 prompt/contexts，人格与上下文全部走 AstrBot 原生链路（天然按人格隔离）。
 repo: "https://github.com/CGTouhou/astrbot_plugin_wake"

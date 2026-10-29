@@ -35,6 +35,12 @@
     "description": "窗口时长（秒）",
     "hint": "她被唤醒后，这段时间内每条消息都会判断是否接话。每回复一次就重新计时。设 0 = 关闭窗口（只做关键词唤醒，回复一次就睡）"
   },
+  "group_debounce_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "群聊防抖开关",
+    "hint": "关闭后群里收到消息立即判断，不再等对方把话打完。反应更快，但连发两句会被当成两次独立判断"
+  },
   "debounce_seconds": {
     "type": "float",
     "default": 1.5,
@@ -46,6 +52,30 @@
     "default": 2.5,
     "description": "输入防抖 · 窗口外（秒）",
     "hint": "窗口外（她不在对话里）的防抖，可以设得比窗口内长，比如 2.5~3。留 0 = 跟随「窗口内」的值。适合「先发一个名字，再补一句」这种打法"
+  },
+  "debounce_max_wait": {
+    "type": "float",
+    "default": 8.0,
+    "description": "群聊最大等待（秒）",
+    "hint": "从这一轮第一条消息算起最多等多久。防止对方一直不停地发、窗口被无限刷新而永远不回复。到点强制判断一次。0 = 不设上限"
+  },
+  "private_debounce_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "私聊防抖开关",
+    "hint": "开启后私聊连发几句会等你说完、合并成一句再回；关闭后每条私聊都独立处理（连发三句会回三次）"
+  },
+  "private_debounce_seconds": {
+    "type": "float",
+    "default": 1.5,
+    "description": "私聊防抖时长（秒）",
+    "hint": "最后一条消息到达后等这么久，期间又来消息就重新计时。建议 1~2 秒，反应太慢就调小"
+  },
+  "private_debounce_max_wait": {
+    "type": "float",
+    "default": 8.0,
+    "description": "私聊最大等待（秒）",
+    "hint": "私聊里从这一轮第一条消息算起最多等多久。对方一直刷屏时到点强制判断一次。0 = 不设上限"
   },
   "reply_probability": {
     "type": "float",

@@ -16,3 +16,6 @@ Thumbs.db
 # 编辑器
 .vscode/
 .idea/
+
+# 本地备份（补丁脚本产生的）
+*.bak-*
